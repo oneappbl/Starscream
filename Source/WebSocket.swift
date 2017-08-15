@@ -428,7 +428,7 @@ open class WebSocket : NSObject, StreamDelegate {
     private func initStreams() {
         //higher level API we will cut over to at some point
         //NSStream.getStreamsToHostWithName(url.host, port: url.port.integerValue, inputStream: &inputStream, outputStream: &outputStream)
-        
+
         // Disconnect and clean up any existing streams before setting up a new pair
         disconnectStream(nil, runDelegate: false)
 
@@ -437,7 +437,7 @@ open class WebSocket : NSObject, StreamDelegate {
 
         var serverHost: String
         var serverPort: UInt32
-        
+
         if let pHost = httpProxyHost {
             connectingToProxy = true
             serverHost = pHost
@@ -460,6 +460,9 @@ open class WebSocket : NSObject, StreamDelegate {
         inputStream = readStream!.takeRetainedValue()
         outputStream = writeStream!.takeRetainedValue()
         guard let inStream = inputStream, let outStream = outputStream else { return }
+        inStream.delegate = self
+        outStream.delegate = self
+
         if let sProxy = socksProxyHost  {
             //print("ProxyConnect using socks proxy server \(sProxy):\(socksProxyPort) user \(socksProxyUsername) password \(socksProxyPassword)")
             let settings = NSMutableDictionary(capacity:4)
@@ -476,9 +479,7 @@ open class WebSocket : NSObject, StreamDelegate {
             inputStream!.setProperty(settings, forKey:Stream.PropertyKey.socksProxyConfigurationKey)
             outputStream!.setProperty(settings, forKey:Stream.PropertyKey.socksProxyConfigurationKey)
         }
-        inStream.delegate = self
-        outStream.delegate = self
-        
+
         CFReadStreamSetDispatchQueue(inStream, WebSocket.sharedWorkQueue)
         CFWriteStreamSetDispatchQueue(outStream, WebSocket.sharedWorkQueue)
         inStream.open()
@@ -487,9 +488,8 @@ open class WebSocket : NSObject, StreamDelegate {
         self.readyToWriteMutex.lock()
         self.readyToWrite = true
         self.readyToWriteMutex.unlock()
-        
     }
-    
+
     /**
      Delegate for the stream methods. Processes incoming bytes
      */
@@ -1125,36 +1125,25 @@ open class WebSocket : NSObject, StreamDelegate {
 
     // MARK: - Proxy suport
 
-    // get proxy setting from device setting
+    /**
+     Get proxy setting from device setting
+     */
     private func configureProxy () {
-        //the proxy config doesn't understand "wss" or "ws" protocols
-        var hURL: URL? = url;
-        if let host = url.host {
-            if let scheme = url.scheme, supportedSSLSchemes.contains(scheme) {
-                hURL = URL(string: "https://"+host)
-            } else {
-                hURL = URL(string: "http://"+host)
-            }
-        }
-        if hURL == nil {
-            hURL = url
-        }
-        guard let proxySettings: NSDictionary = CFNetworkCopySystemProxySettings()?.takeRetainedValue()
-            else {
-                // no proxy setting
-                openConnection()
-                return
+        let proxyUrl = getProxyUrl(fromUrl: url)
+        guard let proxySettings: NSDictionary = CFNetworkCopySystemProxySettings()?.takeRetainedValue() else {
+            // no proxy setting
+            openConnection()
+            return
         }
 
-        let proxies: NSArray = CFNetworkCopyProxiesForURL(hURL! as CFURL, proxySettings).takeRetainedValue()
+        let proxies: NSArray = CFNetworkCopyProxiesForURL(proxyUrl as CFURL, proxySettings).takeRetainedValue()
         guard proxies.count > 0 else {
             openConnection()
             return
         }
 
-        let settings = proxies[0] as! NSDictionary
-
-        if let proxyType: NSString = settings[(kCFProxyTypeKey as NSString)] as? NSString {
+        if let settings = proxies[0] as? NSDictionary,
+            let proxyType = settings[(kCFProxyTypeKey as NSString)] as? NSString {
             switch (proxyType) {
             case kCFProxyTypeAutoConfigurationURL:
                 if let pacURL: NSURL = settings[(kCFProxyAutoConfigurationURLKey as NSString)] as? NSURL {
@@ -1166,25 +1155,24 @@ open class WebSocket : NSObject, StreamDelegate {
                     runPACScript(script: script as String);
                     return;
                 }
-            default: break
+            default:
+                readProxySetting(proxyType: proxyType, settings: settings)
             }
-            readProxySetting(proxyType: proxyType, settings: settings)
         }
         openConnection()
     }
 
     private func readProxySetting(proxyType: NSString, settings: NSDictionary ){
         switch (proxyType) {
-        case kCFProxyTypeHTTP,
-             kCFProxyTypeHTTPS:
+        case kCFProxyTypeHTTP, kCFProxyTypeHTTPS:
             httpProxyHost = settings[(kCFProxyHostNameKey as NSString)] as? String
-            if let portValue: NSNumber = settings[(kCFProxyPortNumberKey as NSString)] as? NSNumber {
+            if let portValue = settings[(kCFProxyPortNumberKey as NSString)] as? NSNumber {
                 httpProxyPort = portValue.intValue
             }
 
         case kCFProxyTypeSOCKS:
             socksProxyHost = settings[(kCFProxyHostNameKey as NSString)] as? String
-            if let portValue: NSNumber = settings[(kCFProxyPortNumberKey as NSString)] as? NSNumber {
+            if let portValue = settings[(kCFProxyPortNumberKey as NSString)] as? NSNumber {
                 socksProxyPort = portValue.intValue
             }
             socksProxyUsername = settings[(kCFProxyUsernameKey as NSString)] as? String
@@ -1206,8 +1194,7 @@ open class WebSocket : NSObject, StreamDelegate {
             return;
         }
 
-        let scheme = PACurl.scheme?.lowercased()
-        guard  scheme == "http" || scheme == "https" else {
+        guard let scheme = PACurl.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
             // Don't know how to read data from this URL, we'll have to give up
             // We'll simply assume no proxies, and start the request as normal
             openConnection()
@@ -1215,13 +1202,13 @@ open class WebSocket : NSObject, StreamDelegate {
         }
 
         let request = URLRequest(url: PACurl)
-        let session = URLSession.shared
-        let task = session.dataTask(with: request) { [weak self] (data: Data?, response: URLResponse?, _: Error?) in
-            if let data = data, let script = String(data: data, encoding: .utf8) {
-                self?.runPACScript(script: script)
+        let task = URLSession.shared.dataTask(with: request) { [weak self] (data: Data?, _: URLResponse?, _: Error?) in
+            guard let s = self else { return }
+            guard let data = data, let script = String(data: data, encoding: .utf8) else {
+                s.openConnection()
                 return
             }
-            self?.openConnection()
+            s.runPACScript(script: script)
         }
         task.resume()
     }
@@ -1237,21 +1224,9 @@ open class WebSocket : NSObject, StreamDelegate {
         // Obtain the list of proxies by running the autoconfiguration script
 
         // CFNetworkCopyProxiesForAutoConfigurationScript doesn't understand ws:// or wss://
-        var hURL: URL? = url;
-        //the proxy config doesn't understand "wss" or "ws" protocols
-        if let host = url.host {
-            if let scheme = url.scheme, supportedSSLSchemes.contains(scheme) {
-                hURL = URL(string: "https://"+host)
-            } else {
-                hURL = URL(string: "http://"+host)
-            }
-        }
-        if hURL == nil {
-            hURL = url
-        }
-
+        let proxyUrl = getProxyUrl(fromUrl: url)
         var error: Unmanaged<CFError>?
-        guard let proxies: NSArray = CFNetworkCopyProxiesForAutoConfigurationScript(script as CFString, hURL! as CFURL, &error)?.takeRetainedValue() else {
+        guard let proxies: NSArray = CFNetworkCopyProxiesForAutoConfigurationScript(script as CFString, proxyUrl as CFURL, &error)?.takeRetainedValue() else {
             openConnection()
             return
         }
@@ -1268,6 +1243,21 @@ open class WebSocket : NSObject, StreamDelegate {
             readProxySetting(proxyType: proxyType, settings: settings)
         }
         openConnection()
+    }
+
+    /**
+     Get url suitable for proxy configuration (the proxy config doesn't understand "wss" or "ws" protocols)
+     */
+    private func getProxyUrl(fromUrl url: URL) -> URL {
+        var proxyUrl: URL? = nil
+        if let host = url.host {
+            if let scheme = url.scheme, supportedSSLSchemes.contains(scheme) {
+                proxyUrl = URL(string: "https://"+host)
+            } else {
+                proxyUrl = URL(string: "http://"+host)
+            }
+        }
+        return proxyUrl ?? url
     }
 
     // private method to open network connection
@@ -1356,13 +1346,18 @@ open class WebSocket : NSObject, StreamDelegate {
         if let protocols = optionalProtocols {
             addHeader(urlRequest, key: headerWSProtocolName, val: protocols.joined(separator: ","))
         }
+        headerSecKey = generateWebSocketKey()
         addHeader(urlRequest, key: headerWSVersionName, val: headerWSVersionValue)
-        addHeader(urlRequest, key: headerWSKeyName, val: generateWebSocketKey())
+        addHeader(urlRequest, key: headerWSKeyName, val: headerSecKey)
         if let origin = origin {
             addHeader(urlRequest, key: headerOriginName, val: origin)
         }
+        if enableCompression {
+            let val = "permessage-deflate; client_max_window_bits; server_max_window_bits=15"
+            addHeader(urlRequest, key: headerWSExtensionName, val: val)
+        }
         addHeader(urlRequest, key: headerWSHostName, val: "\(url.host!):\(port!)")
-        for (key,value) in headers {
+        for (key, value) in headers {
             addHeader(urlRequest, key: key, val: value)
         }
         if let cfHTTPMessage = CFHTTPMessageCopySerializedMessage(urlRequest) {
@@ -1410,6 +1405,7 @@ open class WebSocket : NSObject, StreamDelegate {
                 outStream.write(bytes, maxLength: data.length)
             }
             writeQueue.addOperation(operation)
+            advancedDelegate?.websocketHttpUpgrade(socket: self, request: urlRequest)
         }
     }
 
